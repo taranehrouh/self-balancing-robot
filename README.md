@@ -15,7 +15,7 @@ A two-wheeled **self-balancing robot** designed and built as part of UBC ELEC 39
 
 
 ## Flutter App 
-![Flutter App](media/IMG_0462)
+![Flutter App](media/IMG_0462.png)
 
 ## Control Approach
 - **Kalman Filter** dynamically combines noisy accelerometer data with drifting gyro integration for reliable tilt estimation.
