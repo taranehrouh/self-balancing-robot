@@ -8,3 +8,6 @@ This project is a **self-balancing two-wheeled robot** built with an **Arduino N
 - Motor control via **DRV8833 drivers**  
 - Wireless communication over **Bluetooth (BLE)**  
 - Mobile app for monitoring and control (Flutter-based)  
+
+## Robot 
+![Robot](media/IMG_0460.jpg)
