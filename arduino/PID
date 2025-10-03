@@ -1,0 +1,334 @@
+#include <ArduinoBLE.h>
+#include "Arduino_BMI270_BMM150.h"
+#include <math.h>
+
+//BLE constants
+#define BUFFER_SIZE 20
+String lastMode = "IDLE"; 
+
+//KALMAN FILTER constants
+#define ACC_STD 2
+#define GYRO_STD 1.5
+#define GYRO_STD_SQUARED GYRO_STD * GYRO_STD
+#define ACC_STD_SQUARED ACC_STD * ACC_STD
+float angle_n = 0;
+
+//MOTOR constants
+#define R_motor_F 3
+#define R_motor_B 5
+#define L_motor_F 9
+#define L_motor_B 6
+
+//PID LOOP constants
+float kp, ki, kd;
+float kp_balance = 13.0, ki_balance = 200.0, kd_balance = 0.3;
+float kp_drive = 13.0, ki_drive = 50.0, kd_drive = 0.3;
+
+float previous_error = 0;
+float integral = 0.0;
+float derivative;
+
+float gyroBias; 
+
+float setpoint;
+
+float turnOffset = 0.0;  // Positive = right turn, Negative = left turn
+
+float current_angle; 
+
+unsigned long lastKalmanTime = 0.0;
+unsigned long lastPIDTime = 0.0;
+
+float accX = 0.0, accY = 0.0, accZ = 0.0, gyroX = 0.0, gyroY = 0.0, gyroZ = 0.0;
+
+float currentAngle = 0.0; 
+
+float kalmanUncertainty = ACC_STD_SQUARED, kalGain;
+
+BLEService customService("fa6c75b7-eb43-45c4-b5e5-e3371433a96f");
+BLECharacteristic customCharacteristic(
+  "fa6c75b7-eb43-45c4-b5e5-e3371433a96f", BLERead | BLEWrite | BLENotify, BUFFER_SIZE, false);
+
+String driveMode = "IDLE";
+
+// === Setup ===
+void setup() {
+  Serial.begin(9600);
+  // while (!Serial);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(R_motor_F, OUTPUT);
+  pinMode(R_motor_B, OUTPUT);
+  pinMode(L_motor_F, OUTPUT);
+  pinMode(L_motor_B, OUTPUT);
+
+  if (!BLE.begin()) {
+    Serial.println("Starting BLE failed!");
+    while (1);
+  }
+
+  BLE.setLocalName("BLE-DEVICE");
+  BLE.setDeviceName("BLE-DEVICE");
+  customService.addCharacteristic(customCharacteristic);
+  BLE.addService(customService);
+  customCharacteristic.writeValue("Waiting for data");
+  BLE.advertise();
+  Serial.println("Bluetooth® device active, waiting for connections...");
+
+  if (!IMU.begin()) {
+    Serial.println("IMU Failed!");
+    while (1);
+  }
+
+  for (int i=0; i<500; i++) {
+    while (!IMU.gyroscopeAvailable());
+    IMU.readGyroscope(gyroX, gyroY, gyroZ);
+    gyroBias += gyroX;
+    delay(2);
+  }
+  gyroBias /= 500.0;
+
+}
+
+float KalmanFilter() {
+  float accAngle;
+  
+  if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
+    IMU.readAcceleration(accX, accY, accZ);
+    IMU.readGyroscope(gyroX, gyroY, gyroZ);
+
+    gyroX -= gyroBias;
+
+    unsigned long current_time = micros();
+    float dt = (current_time - lastKalmanTime) / 1000000.0;
+    lastKalmanTime = current_time;
+
+    accAngle = atan2(accY, accZ) * 180 / PI;  
+
+    currentAngle = currentAngle - gyroX * dt;  
+    kalmanUncertainty = kalmanUncertainty + dt * dt * GYRO_STD_SQUARED;
+
+    kalGain = kalmanUncertainty / (kalmanUncertainty + ACC_STD_SQUARED);
+    currentAngle = currentAngle + kalGain * (accAngle - currentAngle);  // Update step
+    kalmanUncertainty = (1.0 - kalGain) * kalmanUncertainty;
+  }
+
+  //currentAngle += 0.7; 
+  return currentAngle;
+}
+
+void resetPID() {
+  integral = 0.0;
+  previous_error = 0.0;
+  lastKalmanTime = micros();
+  lastPIDTime = micros();
+}
+
+// === Motor Control ===
+void applyMotorControl() {
+  if (driveMode != lastMode) {
+    resetPID();
+    if (driveMode == "BALANCE") {
+      kp = kp_balance; ki = ki_balance; kd = kd_balance;
+    } 
+    else if (driveMode == "FORWARD" || driveMode == "BACKWARD" || driveMode == "RIGHT" || driveMode == "LEFT") {
+      kp = kp_drive; ki = ki_drive; kd = kd_drive;
+    }
+  }
+
+  // set the setpoint as before…
+  if (driveMode == "BALANCE") {
+    setpoint = 0.0; 
+  }
+  else if (driveMode == "RIGHT" || driveMode == "LEFT") {
+    setpoint = 1.0;
+  }
+  else if (driveMode == "FORWARD") {
+    setpoint = 2.5;
+    turnOffset = 0;
+  } 
+  else if (driveMode == "BACKWARD") {
+    setpoint = -3.0;
+    turnOffset = 0;
+  }
+
+  unsigned long current_time = micros();
+  float dt = (current_time - lastPIDTime) / 1e6;
+  lastPIDTime = current_time;
+
+  float error = setpoint - angle_n;
+  integral = constrain(integral + error * dt, -4, 4);
+  float derivative = (error - previous_error) / dt;
+  previous_error = error;
+
+  // compute each term separately
+  float Pterm = kp * error;
+  float Iterm = ki * integral;
+  float Dterm = kd * derivative;
+  float output = Pterm + Iterm + Dterm;
+
+  output = constrain(output, -255, 255);
+  int pwm = constrain(abs(output), 7, 255);
+  int leftPWM  = constrain(pwm - turnOffset, 7, 255);
+  int rightPWM = constrain(pwm + turnOffset, 7, 255);
+
+  // drive the motors
+  if (driveMode == "BALANCE" || driveMode == "FORWARD" || driveMode == "BACKWARD") {
+    if (output > 0) {
+      analogWrite(R_motor_F, 255); analogWrite(R_motor_B, 255 - rightPWM);
+      analogWrite(L_motor_B, 255 - leftPWM); analogWrite(L_motor_F, 255);
+    } else {
+      analogWrite(R_motor_F, 255 - rightPWM); analogWrite(R_motor_B, 255);
+      analogWrite(L_motor_B, 255); analogWrite(L_motor_F, 255 - leftPWM);
+    }
+  }
+  else if (driveMode == "STOP") {
+    analogWrite(R_motor_F, 0); analogWrite(R_motor_B, 0);
+    analogWrite(L_motor_B, 0); analogWrite(L_motor_F, 0);
+  }
+  else if (driveMode == "ADD_KI") {
+    ki_drive += 5.0;
+    Serial.println(ki_drive);
+    driveMode = "IDLE";
+  }
+  else if (driveMode == "ADD_KP") {
+    kp_drive += 0.5;
+    Serial.println(kp_drive);
+    driveMode = "IDLE";
+  }
+  else if (driveMode == "ADD_KD") {
+    kd_drive += 0.1;
+    Serial.println(kd_drive);
+    driveMode = "IDLE";
+  }
+  else if (driveMode == "SUB_KI") {
+    ki_drive -= 5.0;
+    Serial.println(ki_drive);
+    driveMode = "IDLE";
+  }
+  else if (driveMode == "SUB_KP") {
+    kp_drive -= 0.5;
+    Serial.println(kp_drive);
+    driveMode = "IDLE";
+  }
+  else if (driveMode == "SUB_KD") {
+    kd_drive -= 0.1;
+    Serial.println(kd_drive);
+    driveMode = "IDLE";
+  }
+  else if (driveMode == "ADD_SP") {
+    setpoint += 0.1;
+    Serial.println(setpoint);
+    driveMode = "IDLE";
+  }
+  else if (driveMode == "SUB_SP") {
+    setpoint -= 0.1;
+    Serial.println(setpoint);
+    driveMode = "IDLE";
+  }
+  else {
+    analogWrite(R_motor_F, 0); analogWrite(R_motor_B, 0);
+    analogWrite(L_motor_B, 0); analogWrite(L_motor_F, 0);
+  }
+
+  lastMode = driveMode;
+}
+
+
+void updatePIDfromSerial() {
+    if (Serial.available()) {
+        String input = Serial.readStringUntil('\n'); 
+        input.trim();  
+
+        // Split the input string into three parts
+        char inputBuffer[32];
+        input.toCharArray(inputBuffer, sizeof(inputBuffer));
+        
+        char *token = strtok(inputBuffer, " ");
+        if (token == NULL) { Serial.println("Invalid input."); return; }
+        float newKp = atof(token);
+
+        token = strtok(NULL, " ");
+        if (token == NULL) { Serial.println("Invalid input."); return; }
+        float newKi = atof(token);
+
+        token = strtok(NULL, " ");
+        if (token == NULL) { Serial.println("Invalid input."); return; }
+        float newKd = atof(token);
+
+        // Update PID values
+        kp = newKp;
+        ki = newKi;
+        kd = newKd;
+
+        resetPID();
+
+        Serial.print("PID Updated: Kp = ");
+        Serial.print(kp);
+        Serial.print(", Ki = ");
+        Serial.print(ki);
+        Serial.print(", Kd = ");
+        Serial.println(kd);
+    }
+}
+
+// === Main Loop ===
+void loop() {
+
+  BLEDevice central = BLE.central();
+
+  if (central) {
+    Serial.print("Connected to central: ");
+    Serial.println(central.address());
+    digitalWrite(LED_BUILTIN, HIGH);
+
+    while (central.connected()) {
+      if (customCharacteristic.written()) {
+        int length = customCharacteristic.valueLength();
+        const unsigned char* receivedData = customCharacteristic.value();
+        char receivedString[length + 1];
+        memcpy(receivedString, receivedData, length);
+        receivedString[length] = '\0';
+
+        Serial.print("Received data: ");
+        Serial.println(receivedString);
+        customCharacteristic.writeValue("Data received");
+
+        if (strcmp(receivedString, "FORWARD") == 0) driveMode = "FORWARD";
+        else if (strcmp(receivedString, "A") == 0) driveMode = "STOP";
+        else if (strcmp(receivedString, "B") == 0) {
+          driveMode = "BALANCE";
+          turnOffset = 0;
+        }
+        else if (strcmp(receivedString, "BACKWARD") == 0) driveMode = "BACKWARD";
+        else if (strcmp(receivedString, "LEFT") == 0) {
+          driveMode = "BALANCE";
+          turnOffset = -40;
+        } 
+        else if (strcmp(receivedString, "RIGHT") == 0) {
+          driveMode = "BALANCE";
+          turnOffset = 40;
+        } 
+        else if (strcmp(receivedString, "ADD_KI") == 0) driveMode = "ADD_KI";
+        else if (strcmp(receivedString, "ADD_KP") == 0) driveMode = "ADD_KP";
+        else if (strcmp(receivedString, "ADD_KD") == 0) driveMode = "ADD_KD";
+        else if (strcmp(receivedString, "SUB_KI") == 0) driveMode = "SUB_KI";
+        else if (strcmp(receivedString, "SUB_KP") == 0) driveMode = "SUB_KP";
+        else if (strcmp(receivedString, "SUB_KD") == 0) driveMode = "SUB_KD";
+        else if (strcmp(receivedString, "ADD_SP") == 0) driveMode = "ADD_SP";
+        else if (strcmp(receivedString, "SUB_SP") == 0) driveMode = "SUB_SP";
+        else driveMode = "IDLE";
+      }
+
+      currentAngle = KalmanFilter();
+      angle_n = currentAngle;
+
+      updatePIDfromSerial();
+      applyMotorControl();
+    }
+
+    digitalWrite(LED_BUILTIN, LOW);
+    Serial.println("Disconnected from central.");
+    driveMode = "IDLE";
+  }
+}
